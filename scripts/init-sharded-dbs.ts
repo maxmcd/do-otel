@@ -131,9 +131,7 @@ for (let shardId = 0; shardId < NUM_SHARDS; shardId++) {
 
 console.log(`\n✅ All ${NUM_SHARDS} sharded databases created successfully!`);
 console.log("\nShard distribution (by hour):");
-console.log(
-  `  Shard 0: Hour 0 (${new Date(START_TS_MS).toISOString()})`
-);
+console.log(`  Shard 0: Hour 0 (${new Date(START_TS_MS).toISOString()})`);
 console.log(
   `  Shard 1: Hour 1 (${new Date(START_TS_MS + HOUR_MS).toISOString()})`
 );
