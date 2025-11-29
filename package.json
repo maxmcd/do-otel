@@ -1,5 +1,5 @@
 {
-  "name": "containers-template",
+  "name": "do-otel",
   "description": "Build a Container-enabled Worker",
   "private": true,
   "scripts": {
