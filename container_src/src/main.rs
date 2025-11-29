@@ -2,11 +2,13 @@ mod http_executor;
 mod sharded_aggregation_rule;
 mod sharded_provider;
 
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::optimizer::OptimizerRule;
 use datafusion::prelude::*;
+use serde::{Deserialize, Serialize};
 use sharded_aggregation_rule::{ShardedAggregationRule, ShardedQueryPlanner};
 use sharded_provider::{ShardMetadata, ShardedSqliteProvider};
 use std::sync::Arc;
@@ -25,7 +27,7 @@ async fn main() -> Result<()> {
         Field::new("status_code", DataType::Int64, true),
         Field::new("user_id", DataType::Utf8, true),
         Field::new("trace_id", DataType::Utf8, true),
-        Field::new("fields_json", DataType::Binary, true),
+        Field::new("fields_json", DataType::Utf8, true),
     ]));
 
     let hour_ms = 3600 * 1_000;
@@ -180,24 +182,62 @@ async fn main() -> Result<()> {
     //     let df = ctx.sql(query6).await?;
     //     df.show().await?;
 
-    let query7 = r#"SELECT
-    (ts_ms / 3600000) AS bucket_index,
-    MIN(ts_ms) AS bucket_min_ts,
-    MAX(ts_ms) AS bucket_max_ts,
-    COUNT(*) AS event_count
-FROM events
-WHERE ts_ms >= 1700870400000 AND ts_ms < 1700874000000
-GROUP BY bucket_index ORDER BY bucket_index"#;
-    println!("SQL: {}\n", query7);
+    // Start HTTP server
+    let app = Router::new()
+        .route("/query", post(query_handler))
+        .with_state(Arc::new(ctx));
 
-    let df = ctx.sql(query7).await?;
-    let physical_plan = df.create_physical_plan().await?;
-    println!("Physical Plan:");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    println!("HTTP server listening on http://0.0.0.0:3000");
     println!(
-        "{}\n",
-        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+        "Send POST requests to /query with JSON body: {{\"sql\": \"SELECT * FROM events LIMIT 10\"}}"
     );
-    let df = ctx.sql(query7).await?;
-    df.show().await?;
+
+    axum::serve(listener, app).await.unwrap();
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct QueryRequest {
+    sql: String,
+}
+
+#[derive(Serialize)]
+struct QueryResponse {
+    data: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+async fn query_handler(
+    State(ctx): State<Arc<SessionContext>>,
+    Json(payload): Json<QueryRequest>,
+) -> Result<Json<QueryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    match execute_query(&ctx, &payload.sql).await {
+        Ok(data) => Ok(Json(QueryResponse { data })),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
+async fn execute_query(ctx: &SessionContext, sql: &str) -> Result<serde_json::Value> {
+    let df = ctx.sql(sql).await?;
+    let batches = df.collect().await?;
+
+    let mut buf = Vec::new();
+    let mut writer = datafusion::arrow::json::ArrayWriter::new(&mut buf);
+    writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
+    writer.finish()?;
+
+    let json_value: serde_json::Value = serde_json::from_slice(&buf)
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+
+    Ok(json_value)
 }
