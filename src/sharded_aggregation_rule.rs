@@ -331,15 +331,33 @@ impl ExtensionPlanner for ShardedAggregatePlanner {
         // Build output schema for the shard queries (must match logical schema)
         let output_schema = build_output_schema(&sharded_agg.schema)?;
 
-        // Create HttpSqliteExec for each shard
+        // Prune shards based on time filters using the provider's pruning logic
+        use crate::sharded_provider::extract_time_range;
+        let (min_time, max_time) =
+            extract_time_range(&sharded_agg.filters, sharded_provider.time_column());
+
+        let relevant_shards: Vec<_> = sharded_provider
+            .shards()
+            .iter()
+            .filter(|shard| shard.overlaps(min_time, max_time))
+            .collect();
+
+        // Handle empty shard list
+        if relevant_shards.is_empty() {
+            return Ok(Some(Arc::new(
+                datafusion::physical_plan::empty::EmptyExec::new(output_schema),
+            )));
+        }
+
+        // Create HttpSqliteExec for each relevant shard
         let mut shard_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        for shard in sharded_provider.shards() {
+        for shard in relevant_shards {
             let executor = Arc::new(HttpSqliteExecutor::new(shard.endpoint_url.clone()));
             let exec = executor.create_exec(sql.clone(), output_schema.clone());
             shard_plans.push(exec);
         }
 
-        // If only one shard, return it directly
+        // If only one shard, return it directly (no need for union or final aggregation)
         if shard_plans.len() == 1 {
             return Ok(Some(shard_plans.into_iter().next().unwrap()));
         }
@@ -701,8 +719,8 @@ mod tests {
 
     fn test_shards() -> Vec<ShardMetadata> {
         vec![
-            ShardMetadata::new("shard_0".into(), "http://localhost:8001".into(), 1000, 1999),
-            ShardMetadata::new("shard_1".into(), "http://localhost:8002".into(), 2000, 2999),
+            ShardMetadata::new("http://localhost:8001".into(), 1000, 1999),
+            ShardMetadata::new("http://localhost:8002".into(), 2000, 2999),
         ]
     }
 

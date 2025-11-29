@@ -17,16 +17,14 @@ use crate::http_executor::HttpSqliteExecutor;
 
 #[derive(Debug, Clone)]
 pub struct ShardMetadata {
-    pub name: String,
     pub endpoint_url: String,
     pub start_time: i64,
     pub end_time: i64,
 }
 
 impl ShardMetadata {
-    pub fn new(name: String, endpoint_url: String, start_time: i64, end_time: i64) -> Self {
+    pub fn new(endpoint_url: String, start_time: i64, end_time: i64) -> Self {
         Self {
-            name,
             endpoint_url,
             start_time,
             end_time,
@@ -52,17 +50,47 @@ pub fn extract_time_range(filters: &[Expr], time_column: &str) -> (Option<i64>, 
     for filter in filters {
         match filter {
             Expr::BinaryExpr(binary) => {
-                if let Expr::Column(col) = &*binary.left {
+                if binary.op == datafusion::logical_expr::Operator::And {
+                    // Handle compound AND expressions by recursively extracting from both sides
+                    let (left_min, left_max) =
+                        extract_time_range(&[*binary.left.clone()], time_column);
+                    let (right_min, right_max) =
+                        extract_time_range(&[*binary.right.clone()], time_column);
+                    min_time = match (left_min, right_min) {
+                        (Some(l), Some(r)) => Some(l.max(r)),
+                        (Some(l), None) => Some(l),
+                        (None, Some(r)) => Some(r),
+                        (None, None) => None,
+                    };
+                    max_time = match (left_max, right_max) {
+                        (Some(l), Some(r)) => Some(l.min(r)),
+                        (Some(l), None) => Some(l),
+                        (None, Some(r)) => Some(r),
+                        (None, None) => None,
+                    };
+                } else if let Expr::Column(col) = &*binary.left {
                     if col.name == time_column {
                         if let Expr::Literal(scalar, _) = &*binary.right {
                             if let Ok(val) = scalar.to_string().parse::<i64>() {
                                 match binary.op {
-                                    datafusion::logical_expr::Operator::Gt
-                                    | datafusion::logical_expr::Operator::GtEq => {
+                                    datafusion::logical_expr::Operator::Gt => {
+                                        // Exclusive lower bound: add 1 to make it inclusive
+                                        let adjusted = val.saturating_add(1);
+                                        min_time = Some(
+                                            min_time.map_or(adjusted, |t: i64| t.max(adjusted)),
+                                        );
+                                    }
+                                    datafusion::logical_expr::Operator::GtEq => {
                                         min_time = Some(min_time.map_or(val, |t: i64| t.max(val)));
                                     }
-                                    datafusion::logical_expr::Operator::Lt
-                                    | datafusion::logical_expr::Operator::LtEq => {
+                                    datafusion::logical_expr::Operator::Lt => {
+                                        // Exclusive upper bound: subtract 1 to make it inclusive
+                                        let adjusted = val.saturating_sub(1);
+                                        max_time = Some(
+                                            max_time.map_or(adjusted, |t: i64| t.min(adjusted)),
+                                        );
+                                    }
+                                    datafusion::logical_expr::Operator::LtEq => {
                                         max_time = Some(max_time.map_or(val, |t: i64| t.min(val)));
                                     }
                                     datafusion::logical_expr::Operator::Eq => {
@@ -260,32 +288,18 @@ impl ShardedSqliteProvider {
         &self.shards
     }
 
+    pub fn time_column(&self) -> &str {
+        &self.time_column
+    }
+
     fn get_relevant_shards(&self, filters: &[Expr]) -> Vec<ShardMetadata> {
         let (min_time, max_time) = extract_time_range(filters, &self.time_column);
 
-        let relevant_shards: Vec<ShardMetadata> = self
-            .shards
+        self.shards
             .iter()
             .filter(|shard| shard.overlaps(min_time, max_time))
             .cloned()
-            .collect();
-
-        println!(
-            "🔍 Shard pruning: {} of {} shards selected for time range {:?} to {:?}",
-            relevant_shards.len(),
-            self.shards.len(),
-            min_time,
-            max_time
-        );
-
-        for shard in &relevant_shards {
-            println!(
-                "  ✓ {}: {} [{} - {}]",
-                shard.name, shard.endpoint_url, shard.start_time, shard.end_time
-            );
-        }
-
-        relevant_shards
+            .collect()
     }
 }
 
@@ -331,7 +345,6 @@ impl TableProvider for ShardedSqliteProvider {
 
         // Handle empty shard list
         if relevant_shards.is_empty() {
-            println!("⚠️  No shards match the query criteria - returning empty result");
             return Ok(Arc::new(EmptyExec::new(self.schema.clone())));
         }
 
@@ -373,9 +386,9 @@ mod tests {
 
     fn test_shards() -> Vec<ShardMetadata> {
         vec![
-            ShardMetadata::new("shard_0".into(), "http://localhost:8001".into(), 1000, 1999),
-            ShardMetadata::new("shard_1".into(), "http://localhost:8002".into(), 2000, 2999),
-            ShardMetadata::new("shard_2".into(), "http://localhost:8003".into(), 3000, 3999),
+            ShardMetadata::new("http://localhost:8001".into(), 1000, 1999),
+            ShardMetadata::new("http://localhost:8002".into(), 2000, 2999),
+            ShardMetadata::new("http://localhost:8003".into(), 3000, 3999),
         ]
     }
 
@@ -422,37 +435,37 @@ mod tests {
 
     #[test]
     fn test_shard_overlaps_full_overlap() {
-        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        let shard = ShardMetadata::new("http://x".into(), 1000, 2000);
         assert!(shard.overlaps(Some(500), Some(2500)));
     }
 
     #[test]
     fn test_shard_overlaps_partial_start() {
-        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        let shard = ShardMetadata::new("http://x".into(), 1000, 2000);
         assert!(shard.overlaps(Some(1500), Some(2500)));
     }
 
     #[test]
     fn test_shard_overlaps_partial_end() {
-        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        let shard = ShardMetadata::new("http://x".into(), 1000, 2000);
         assert!(shard.overlaps(Some(500), Some(1500)));
     }
 
     #[test]
     fn test_shard_overlaps_no_overlap_before() {
-        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        let shard = ShardMetadata::new("http://x".into(), 1000, 2000);
         assert!(!shard.overlaps(Some(100), Some(500)));
     }
 
     #[test]
     fn test_shard_overlaps_no_overlap_after() {
-        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        let shard = ShardMetadata::new("http://x".into(), 1000, 2000);
         assert!(!shard.overlaps(Some(2500), Some(3000)));
     }
 
     #[test]
     fn test_shard_overlaps_unbounded() {
-        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        let shard = ShardMetadata::new("http://x".into(), 1000, 2000);
         assert!(shard.overlaps(None, None));
     }
 

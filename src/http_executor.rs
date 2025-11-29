@@ -1,4 +1,6 @@
-use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringBuilder};
+use datafusion::arrow::array::{
+    ArrayRef, Float64Array, Int32Array, Int64Array, RecordBatch, StringBuilder,
+};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -103,6 +105,13 @@ impl HttpSqliteExecutor {
                         .collect();
                     columns.push(Arc::new(Int64Array::from(values)));
                 }
+                DataType::Int32 => {
+                    let values: Vec<Option<i32>> = rows
+                        .iter()
+                        .map(|row| row.get(col_idx).and_then(|v| v.as_i64().map(|i| i as i32)))
+                        .collect();
+                    columns.push(Arc::new(Int32Array::from(values)));
+                }
                 DataType::Float64 => {
                     let values: Vec<Option<f64>> = rows
                         .iter()
@@ -177,6 +186,8 @@ impl HttpSqliteExec {
         }
     }
 
+    // used in tests
+    #[allow(dead_code)]
     pub fn sql(&self) -> &str {
         &self.sql
     }

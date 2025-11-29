@@ -5,10 +5,9 @@ import { existsSync, unlinkSync } from "fs";
 const NUM_SHARDS = 3;
 const EVENTS_PER_SHARD = 100;
 
-// Base timestamp: 2024-01-15 00:00:00 UTC in nanoseconds
+// Base timestamp: 2024-01-15 00:00:00 UTC in milliseconds
 const HOUR_MS = 3600 * 1_000;
-const NOW_MS = 1700870400;
-const BASE_TS_MS = NOW_MS - 3 * HOUR_MS;
+const START_TS_MS = 1700870400 * 1000;
 
 const services = [
   "api-gateway",
@@ -54,7 +53,7 @@ for (let shardId = 0; shardId < NUM_SHARDS; shardId++) {
 
   const db = new Database(dbPath);
 
-  const hourStart = BASE_TS_MS + shardId * HOUR_MS;
+  const hourStart = START_TS_MS + shardId * HOUR_MS;
   const hourEnd = hourStart + HOUR_MS;
   const hourStartDate = new Date(hourStart);
 
@@ -133,15 +132,11 @@ for (let shardId = 0; shardId < NUM_SHARDS; shardId++) {
 console.log(`\n✅ All ${NUM_SHARDS} sharded databases created successfully!`);
 console.log("\nShard distribution (by hour):");
 console.log(
-  `  Shard 0: Hour 0 (${new Date(Number(BASE_TS_MS / 1_000)).toISOString()})`
+  `  Shard 0: Hour 0 (${new Date(START_TS_MS).toISOString()})`
 );
 console.log(
-  `  Shard 1: Hour 1 (${new Date(
-    Number((BASE_TS_MS + HOUR_MS) / 1_000)
-  ).toISOString()})`
+  `  Shard 1: Hour 1 (${new Date(START_TS_MS + HOUR_MS).toISOString()})`
 );
 console.log(
-  `  Shard 2: Hour 2 (${new Date(
-    Number((BASE_TS_MS + 2 * HOUR_MS) / 1_000)
-  ).toISOString()})`
+  `  Shard 2: Hour 2 (${new Date(START_TS_MS + 2 * HOUR_MS).toISOString()})`
 );
