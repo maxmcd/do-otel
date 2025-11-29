@@ -4,7 +4,7 @@
 use datafusion::error::DataFusionError;
 use datafusion::sql::sqlparser::ast::{
     self, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList, Ident,
-    ObjectNamePart, Visit, VisitorMut,
+    ObjectNamePart, VisitMut, VisitorMut,
 };
 
 use std::fmt::Display;
@@ -290,14 +290,6 @@ impl SQLiteIntervalVisitor {
 pub fn apply_sqlite_interval_transform(
     ast: ast::Statement,
 ) -> Result<ast::Statement, DataFusionError> {
-    // TODO: Implement full INTERVAL transformation
-    // This would walk the AST using VisitorMut and transform:
-    //   column + INTERVAL '1 DAY' -> datetime(column, '+1 day')
-    // For now, return as-is
-    Ok(ast)
-}
-
-fn sqlite_ast_analyzer(ast: ast::Statement) -> Result<ast::Statement, DataFusionError> {
     match ast {
         ast::Statement::Query(query) => {
             let mut new_query = query.clone();
@@ -305,7 +297,7 @@ fn sqlite_ast_analyzer(ast: ast::Statement) -> Result<ast::Statement, DataFusion
             // iterate over the query and find any INTERVAL statements
             // find the column they target, and replace the INTERVAL and column with e.g. datetime(column, '+1 day')
             let mut interval_visitor = SQLiteIntervalVisitor::default();
-            let _ = new_query.visit(&mut interval_visitor);
+            let _ = VisitMut::visit(&mut new_query, &mut interval_visitor);
 
             Ok(ast::Statement::Query(new_query))
         }

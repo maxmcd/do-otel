@@ -8,12 +8,6 @@ edition = "2024"
 datafusion = "51.0"
 datafusion-sql = "51.0"
 
-# Arrow for data format (use versions from datafusion)
-datafusion-federation = { version = "0.4.11", features = ["sql"] }
-rusqlite = "0.32"
-datafusion-table-providers = { version = "0.8", features = [
-    "sqlite",
-] }
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"

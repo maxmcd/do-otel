@@ -1,24 +1,23 @@
 mod http_executor;
+mod sharded_aggregation_rule;
 mod sharded_provider;
-mod sqlite_interval;
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::error::Result;
+use datafusion::execution::SessionStateBuilder;
+use datafusion::optimizer::OptimizerRule;
 use datafusion::prelude::*;
+use sharded_aggregation_rule::{ShardedAggregationRule, ShardedQueryPlanner};
 use sharded_provider::{ShardMetadata, ShardedSqliteProvider};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("=== Sharded Time-Series SQLite Query System with HTTP Transport ===\n");
+    println!("=== Sharded Time-Series SQLite Query System ===\n");
 
     // Define the schema for our time-series data
     let schema: SchemaRef = Arc::new(Schema::new(vec![
-        Field::new(
-            "ts_ns",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
+        Field::new("ts_ns", DataType::Int64, false),
         Field::new("service_name", DataType::Utf8, false),
         Field::new("endpoint", DataType::Utf8, false),
         Field::new("count", DataType::Int64, false),
@@ -29,20 +28,20 @@ async fn main() -> Result<()> {
         ShardMetadata::new(
             "shard_2023_11_25".to_string(),
             "http://localhost:8001/query".to_string(),
-            1700870400,  // 2023-11-25 00:00:00
-            1700956799,  // 2023-11-25 23:59:59
+            1700870400, // 2023-11-25 00:00:00
+            1700956799, // 2023-11-25 23:59:59
         ),
         ShardMetadata::new(
             "shard_2023_11_26".to_string(),
             "http://localhost:8002/query".to_string(),
-            1700956800,  // 2023-11-26 00:00:00
-            1701043199,  // 2023-11-26 23:59:59
+            1700956800, // 2023-11-26 00:00:00
+            1701043199, // 2023-11-26 23:59:59
         ),
         ShardMetadata::new(
             "shard_2023_11_27".to_string(),
             "http://localhost:8003/query".to_string(),
-            1701043200,  // 2023-11-27 00:00:00
-            1701129599,  // 2023-11-27 23:59:59
+            1701043200, // 2023-11-27 00:00:00
+            1701129599, // 2023-11-27 23:59:59
         ),
     ];
 
@@ -54,54 +53,124 @@ async fn main() -> Result<()> {
         "ts_ns".to_string(),
     );
 
-    // Register with DataFusion
-    let ctx = SessionContext::new();
+    // Get default optimizer rules and prepend our sharded aggregation rule
+    let default_rules = datafusion::optimizer::Optimizer::new().rules;
+    let mut rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> =
+        vec![Arc::new(ShardedAggregationRule::new("events".to_string()))];
+    rules.extend(default_rules);
+
+    // Create session with our optimizer rule and custom query planner
+    let state = SessionStateBuilder::new()
+        .with_default_features()
+        .with_optimizer_rules(rules)
+        .with_query_planner(Arc::new(ShardedQueryPlanner::new()))
+        .build();
+
+    let ctx = SessionContext::new_with_state(state);
     ctx.register_table("events", Arc::new(table))?;
 
     println!("📊 System initialized with 3 shards\n");
     println!("--- Example Queries ---\n");
 
-    // Example 1: Simple query with time filter
-    println!("🔍 Query 1: SELECT with time filter (should prune shards)\n");
-    let query1 = "SELECT service_name, endpoint, count
-                  FROM events
-                  WHERE ts_ns > 1700900000
-                  LIMIT 10";
-
+    // Example 1: Simple query - will hit all shards (no time filter)
+    println!("🔍 Query 1: SELECT * (no time filter - all shards)\n");
+    let query1 = "SELECT service_name, endpoint, count FROM events LIMIT 10";
     println!("SQL: {}\n", query1);
 
     let df = ctx.sql(query1).await?;
-    println!("Logical Plan:");
-    println!("{}\n", df.logical_plan().display_indent());
+    let physical_plan = df.create_physical_plan().await?;
+    println!("Physical Plan:");
+    println!(
+        "{}\n",
+        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+    );
 
-    // Example 2: Aggregate query with GROUP BY
-    println!("🔍 Query 2: Aggregate with GROUP BY (pushdown to shards)\n");
-    let query2 = "SELECT service_name, SUM(count) as total
-                  FROM events
-                  WHERE ts_ns > 1700900000
-                  GROUP BY service_name";
-
+    // Example 2: Query with time filter - should prune to 1 shard
+    println!("🔍 Query 2: SELECT with time filter (prunes to 1 shard)\n");
+    let query2 = "SELECT service_name, endpoint, count 
+                  FROM events 
+                  WHERE ts_ns >= 1700870400 AND ts_ns < 1700956800
+                  LIMIT 10";
     println!("SQL: {}\n", query2);
 
     let df = ctx.sql(query2).await?;
-    println!("Logical Plan:");
-    println!("{}\n", df.logical_plan().display_indent());
+    let physical_plan = df.create_physical_plan().await?;
+    println!("Physical Plan:");
+    println!(
+        "{}\n",
+        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+    );
 
-    // Example 3: Query with INTERVAL (will be transformed to SQLite date functions)
-    println!("🔍 Query 3: Query with INTERVAL expressions\n");
-    println!("Note: DataFusion INTERVAL syntax will be transformed to SQLite date/datetime functions\n");
-    println!("Example transformation:");
-    println!("  ts_ns + INTERVAL '1 day'  ->  datetime(ts_ns, '+1 days')");
-    println!("  ts_ns + INTERVAL '5 mins' ->  datetime(ts_ns, '+5 minutes')\n");
+    // Example 3: Query spanning 2 shards
+    println!("🔍 Query 3: SELECT spanning 2 shards\n");
+    let query3 = "SELECT service_name, endpoint, count 
+                  FROM events 
+                  WHERE ts_ns >= 1700900000 AND ts_ns < 1701000000
+                  LIMIT 10";
+    println!("SQL: {}\n", query3);
 
-    println!("✅ System ready to accept queries!");
+    let df = ctx.sql(query3).await?;
+    let physical_plan = df.create_physical_plan().await?;
+    println!("Physical Plan:");
+    println!(
+        "{}\n",
+        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+    );
+
+    // Example 4: Aggregate query (now pushed down to shards!)
+    println!("🔍 Query 4: Aggregate (pushed down to shards with final aggregation)\n");
+    let query4 = "SELECT service_name, SUM(count) as total
+                  FROM events
+                  GROUP BY service_name";
+    println!("SQL: {}\n", query4);
+
+    let df = ctx.sql(query4).await?;
+    let physical_plan = df.create_physical_plan().await?;
+    println!("Physical Plan:");
+    println!(
+        "{}\n",
+        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+    );
+
+    // Example 5: Simple COUNT(*) aggregate
+    println!("🔍 Query 5: Simple COUNT(*) aggregate\n");
+    let query5 = "SELECT COUNT(*) FROM events";
+    println!("SQL: {}\n", query5);
+
+    let df = ctx.sql(query5).await?;
+    let physical_plan = df.create_physical_plan().await?;
+    println!("Physical Plan:");
+    println!(
+        "{}\n",
+        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+    );
+
+    // Example 6: Time bucketing with computed GROUP BY
+    println!("🔍 Query 6: Time bucketing with computed GROUP BY\n");
+    let query6 = r#"SELECT
+    (ts_ns / 1000) AS bucket_index,
+    MIN(ts_ns) AS bucket_min_ts,
+    MAX(ts_ns) AS bucket_max_ts,
+    SUM(count) AS total_count
+FROM events
+GROUP BY bucket_index"#;
+    println!("SQL: {}\n", query6);
+
+    let df = ctx.sql(query6).await?;
+    let physical_plan = df.create_physical_plan().await?;
+    println!("Physical Plan:");
+    println!(
+        "{}\n",
+        datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+    );
+
+    println!("✅ Compilation and planning successful!");
     println!("\n📝 Notes:");
-    println!("  - Each HTTP endpoint should accept POST /query with JSON: {{\"sql\": \"SELECT ...\"}}");
-    println!("  - Response should be JSON: {{\"rows\": [{{\"col\": val, ...}}, ...]}}");
-    println!("  - Shard pruning happens based on time range filters");
-    println!("  - Aggregates are pushed down to shards (Map phase)");
-    println!("  - DataFusion combines results (Reduce phase)");
-    println!("  - INTERVAL expressions are transformed to SQLite-compatible functions");
+    println!("  - Shard pruning works based on time filters");
+    println!("  - Aggregates (COUNT, SUM, MIN, MAX) are pushed down to shards");
+    println!("  - Computed GROUP BY expressions (e.g., ts_ns / 1000) are pushed to shards");
+    println!("  - Final aggregation combines partial results from shards");
+    println!("\n⚠️  To actually execute queries, start HTTP shard servers on ports 8001-8003");
 
     Ok(())
 }

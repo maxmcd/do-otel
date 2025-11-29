@@ -2,11 +2,11 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::error::{DataFusionError, Result};
+use datafusion::error::Result;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_federation::FederatedTableProviderAdaptor;
-use datafusion_federation::sql::{RemoteTableRef, SQLFederationProvider, SQLTableSource};
+use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::union::UnionExec;
 use std::sync::Arc;
 
 use crate::http_executor::HttpSqliteExecutor;
@@ -84,6 +84,148 @@ pub fn extract_time_range(filters: &[Expr], time_column: &str) -> (Option<i64>, 
 }
 
 // ============================================================================
+// SINGLE SHARD TABLE PROVIDER
+// ============================================================================
+
+/// A table provider for a single SQLite shard accessed over HTTP
+#[derive(Debug)]
+pub struct SingleShardProvider {
+    schema: SchemaRef,
+    table_name: String,
+    executor: Arc<HttpSqliteExecutor>,
+}
+
+impl SingleShardProvider {
+    pub fn new(schema: SchemaRef, table_name: String, executor: Arc<HttpSqliteExecutor>) -> Self {
+        Self {
+            schema,
+            table_name,
+            executor,
+        }
+    }
+
+    /// Build SQL query from projection and filters
+    fn build_sql(
+        &self,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> String {
+        // Build SELECT clause
+        let select_clause = if let Some(proj) = projection {
+            if proj.is_empty() {
+                "*".to_string()
+            } else {
+                proj.iter()
+                    .map(|&i| self.schema.field(i).name().clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        } else {
+            "*".to_string()
+        };
+
+        let mut sql = format!("SELECT {} FROM {}", select_clause, self.table_name);
+
+        // Add WHERE clause from filters
+        let where_clauses: Vec<String> = filters.iter().filter_map(Self::expr_to_sql).collect();
+        if !where_clauses.is_empty() {
+            sql.push_str(&format!(" WHERE {}", where_clauses.join(" AND ")));
+        }
+
+        // Add LIMIT
+        if let Some(l) = limit {
+            sql.push_str(&format!(" LIMIT {}", l));
+        }
+
+        sql
+    }
+
+    /// Convert DataFusion expression to SQL string
+    fn expr_to_sql(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Column(col) => Some(col.name.clone()),
+
+            Expr::BinaryExpr(binary) => {
+                let left = Self::expr_to_sql(&binary.left)?;
+                let right = Self::expr_to_sql(&binary.right)?;
+                let op = format!("{}", binary.op);
+                Some(format!("{} {} {}", left, op, right))
+            }
+
+            Expr::Literal(scalar, _) => match scalar {
+                datafusion::scalar::ScalarValue::Int64(Some(v)) => Some(v.to_string()),
+                datafusion::scalar::ScalarValue::Float64(Some(v)) => Some(v.to_string()),
+                datafusion::scalar::ScalarValue::Utf8(Some(s)) => {
+                    Some(format!("'{}'", s.replace('\'', "''")))
+                }
+                datafusion::scalar::ScalarValue::Boolean(Some(b)) => {
+                    Some(if *b { "1" } else { "0" }.to_string())
+                }
+                _ => None,
+            },
+
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for SingleShardProvider {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if Self::expr_to_sql(f).is_some() {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let sql = self.build_sql(projection, filters, limit);
+
+        // Determine output schema based on projection
+        let output_schema = if let Some(proj) = projection {
+            if proj.is_empty() {
+                self.schema.clone()
+            } else {
+                let fields: Vec<_> = proj.iter().map(|&i| self.schema.field(i).clone()).collect();
+                Arc::new(datafusion::arrow::datatypes::Schema::new(fields))
+            }
+        } else {
+            self.schema.clone()
+        };
+
+        Ok(self.executor.create_exec(sql, output_schema))
+    }
+}
+
+// ============================================================================
 // SHARDED SQLITE TABLE PROVIDER
 // ============================================================================
 
@@ -110,6 +252,14 @@ impl ShardedSqliteProvider {
         }
     }
 
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn shards(&self) -> &[ShardMetadata] {
+        &self.shards
+    }
+
     fn get_relevant_shards(&self, filters: &[Expr]) -> Vec<ShardMetadata> {
         let (min_time, max_time) = extract_time_range(filters, &self.time_column);
 
@@ -129,40 +279,13 @@ impl ShardedSqliteProvider {
         );
 
         for shard in &relevant_shards {
-            println!("  ✓ {}: {} [{} - {}]", shard.name, shard.endpoint_url, shard.start_time, shard.end_time);
+            println!(
+                "  ✓ {}: {} [{} - {}]",
+                shard.name, shard.endpoint_url, shard.start_time, shard.end_time
+            );
         }
 
         relevant_shards
-    }
-
-    fn create_federated_provider(
-        &self,
-        shards: Vec<ShardMetadata>,
-    ) -> Result<Arc<dyn TableProvider>> {
-        // Create a federation provider for the first shard
-        // In a real implementation, you'd want to union across all shards
-        if shards.is_empty() {
-            return Err(DataFusionError::Plan(
-                "No shards available for query".to_string(),
-            ));
-        }
-
-        // For now, create a simple union of all shard providers
-        // In practice, you might want to use UnionExec or custom logic
-        let shard = &shards[0];
-        let executor = Arc::new(HttpSqliteExecutor::new(
-            shard.name.clone(),
-            shard.endpoint_url.clone(),
-        ));
-
-        let fed_provider = Arc::new(SQLFederationProvider::new(executor));
-        let table_source = Arc::new(SQLTableSource::new_with_schema(
-            fed_provider,
-            RemoteTableRef::parse_with_default_dialect(&self.table_name)?,
-            Arc::clone(&self.schema),
-        ));
-
-        Ok(Arc::new(FederatedTableProviderAdaptor::new(table_source)))
     }
 }
 
@@ -186,7 +309,13 @@ impl TableProvider for ShardedSqliteProvider {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         Ok(filters
             .iter()
-            .map(|_| TableProviderFilterPushDown::Inexact)
+            .map(|f| {
+                if SingleShardProvider::expr_to_sql(f).is_some() {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
             .collect())
     }
 
@@ -200,10 +329,260 @@ impl TableProvider for ShardedSqliteProvider {
         // Prune shards based on time filters
         let relevant_shards = self.get_relevant_shards(filters);
 
-        // Create a federated provider for the relevant shards
-        let provider = self.create_federated_provider(relevant_shards)?;
+        // Handle empty shard list
+        if relevant_shards.is_empty() {
+            println!("⚠️  No shards match the query criteria - returning empty result");
+            return Ok(Arc::new(EmptyExec::new(self.schema.clone())));
+        }
 
-        // Delegate to the federated provider's scan
-        provider.scan(state, projection, filters, limit).await
+        // Create execution plans for each shard
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+
+        for shard in relevant_shards {
+            let executor = Arc::new(HttpSqliteExecutor::new(shard.endpoint_url.clone()));
+
+            let shard_provider =
+                SingleShardProvider::new(self.schema.clone(), self.table_name.clone(), executor);
+
+            let plan = shard_provider
+                .scan(state, projection, filters, limit)
+                .await?;
+            plans.push(plan);
+        }
+
+        // If only one shard, return it directly
+        if plans.len() == 1 {
+            return Ok(plans.into_iter().next().unwrap());
+        }
+
+        // Combine with UnionExec
+        UnionExec::try_new(plans)
     }
+}
+
+// ============================================================================
+// TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http_executor::HttpSqliteExec;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::prelude::*;
+
+    fn test_shards() -> Vec<ShardMetadata> {
+        vec![
+            ShardMetadata::new("shard_0".into(), "http://localhost:8001".into(), 1000, 1999),
+            ShardMetadata::new("shard_1".into(), "http://localhost:8002".into(), 2000, 2999),
+            ShardMetadata::new("shard_2".into(), "http://localhost:8003".into(), 3000, 3999),
+        ]
+    }
+
+    fn test_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("ts_ns", DataType::Int64, false),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("endpoint", DataType::Utf8, false),
+            Field::new("count", DataType::Int64, false),
+        ]))
+    }
+
+    fn create_test_context() -> SessionContext {
+        let table = ShardedSqliteProvider::new(
+            test_schema(),
+            test_shards(),
+            "events".to_string(),
+            "ts_ns".to_string(),
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table("events", Arc::new(table)).unwrap();
+        ctx
+    }
+
+    /// Extract SQL queries from HttpSqliteExec nodes in a physical plan
+    fn extract_shard_sql(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        let mut queries = Vec::new();
+        collect_shard_sql(plan, &mut queries);
+        queries
+    }
+
+    fn collect_shard_sql(plan: &Arc<dyn ExecutionPlan>, queries: &mut Vec<String>) {
+        if let Some(http_exec) = plan.as_any().downcast_ref::<HttpSqliteExec>() {
+            queries.push(http_exec.sql().to_string());
+        }
+        for child in plan.children() {
+            collect_shard_sql(child, queries);
+        }
+    }
+
+    // ========================================================================
+    // SHARD METADATA TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_shard_overlaps_full_overlap() {
+        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        assert!(shard.overlaps(Some(500), Some(2500)));
+    }
+
+    #[test]
+    fn test_shard_overlaps_partial_start() {
+        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        assert!(shard.overlaps(Some(1500), Some(2500)));
+    }
+
+    #[test]
+    fn test_shard_overlaps_partial_end() {
+        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        assert!(shard.overlaps(Some(500), Some(1500)));
+    }
+
+    #[test]
+    fn test_shard_overlaps_no_overlap_before() {
+        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        assert!(!shard.overlaps(Some(100), Some(500)));
+    }
+
+    #[test]
+    fn test_shard_overlaps_no_overlap_after() {
+        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        assert!(!shard.overlaps(Some(2500), Some(3000)));
+    }
+
+    #[test]
+    fn test_shard_overlaps_unbounded() {
+        let shard = ShardMetadata::new("s".into(), "http://x".into(), 1000, 2000);
+        assert!(shard.overlaps(None, None));
+    }
+
+    // ========================================================================
+    // SHARD PRUNING TESTS
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_no_filter_queries_all_shards() {
+        let ctx = create_test_context();
+        let df = ctx.sql("SELECT * FROM events").await.unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let queries = extract_shard_sql(&plan);
+        assert_eq!(queries.len(), 3, "Should query all 3 shards when no filter");
+    }
+
+    #[tokio::test]
+    async fn test_filter_prunes_to_single_shard() {
+        let ctx = create_test_context();
+        // Use range that's clearly within shard_0 (1000-1999)
+        let df = ctx
+            .sql("SELECT * FROM events WHERE ts_ns >= 1000 AND ts_ns < 1500")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let queries = extract_shard_sql(&plan);
+        assert_eq!(queries.len(), 1, "Should query only 1 shard");
+    }
+
+    #[tokio::test]
+    async fn test_filter_prunes_to_two_shards() {
+        let ctx = create_test_context();
+        let df = ctx
+            .sql("SELECT * FROM events WHERE ts_ns >= 1500 AND ts_ns < 2500")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let queries = extract_shard_sql(&plan);
+        assert_eq!(queries.len(), 2, "Should query 2 shards");
+    }
+
+    #[tokio::test]
+    async fn test_exact_timestamp_routes_to_single_shard() {
+        let ctx = create_test_context();
+        let df = ctx
+            .sql("SELECT * FROM events WHERE ts_ns = 2500")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let queries = extract_shard_sql(&plan);
+        assert_eq!(queries.len(), 1, "Exact match should route to 1 shard");
+    }
+
+    // ========================================================================
+    // FILTER PUSHDOWN TESTS
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_where_clause_pushed_to_sql() {
+        let ctx = create_test_context();
+        // Use range that's clearly within shard_0 (1000-1999)
+        let df = ctx
+            .sql("SELECT * FROM events WHERE ts_ns >= 1000 AND ts_ns < 1500")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let queries = extract_shard_sql(&plan);
+        assert_eq!(queries.len(), 1);
+        assert!(queries[0].contains("WHERE"), "SQL should contain WHERE");
+        assert!(
+            queries[0].contains("ts_ns >= 1000"),
+            "SQL should contain filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_projection_pushed_to_sql() {
+        let ctx = create_test_context();
+        let df = ctx
+            .sql("SELECT service_name, count FROM events")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let queries = extract_shard_sql(&plan);
+        for sql in &queries {
+            assert!(
+                sql.contains("service_name"),
+                "SQL should select service_name"
+            );
+            assert!(sql.contains("count"), "SQL should select count");
+            assert!(!sql.contains("SELECT *"), "SQL should not be SELECT *");
+        }
+    }
+
+    // ========================================================================
+    // AGGREGATE PUSHDOWN TESTS
+    // These document expected behavior - some are ignored until implemented
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_without_optimizer_aggregate_not_pushed_down() {
+        // Without the optimizer rule, aggregates are NOT pushed
+        let ctx = create_test_context();
+        let df = ctx
+            .sql("SELECT service_name, SUM(count) as total FROM events GROUP BY service_name")
+            .await
+            .unwrap();
+        let plan = df.create_physical_plan().await.unwrap();
+
+        let queries = extract_shard_sql(&plan);
+        for sql in &queries {
+            // Without optimizer, shards just get columns, no aggregation
+            assert!(
+                !sql.to_uppercase().contains("SUM("),
+                "Without optimizer, SUM should NOT be pushed: {}",
+                sql
+            );
+            assert!(
+                !sql.to_uppercase().contains("GROUP BY"),
+                "Without optimizer, GROUP BY should NOT be pushed: {}",
+                sql
+            );
+        }
+    }
+
+    // Tests WITH the optimizer rule are in sharded_aggregation_rule.rs
 }
