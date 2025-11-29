@@ -982,6 +982,8 @@ mod tests {
         let queries = extract_shard_sql(&physical_plan);
         println!("Shard queries: {:?}", queries);
 
+        println!("{:?}", queries[0]);
+
         assert!(!queries.is_empty(), "Should have shard queries");
         for sql in &queries {
             // Verify the division expression is pushed
@@ -1011,6 +1013,21 @@ mod tests {
                 sql
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_join() {
+        let ctx = create_test_context_with_rule();
+        let df = ctx
+            .sql("SELECT * FROM events where http_status = 200")
+            .await
+            .unwrap();
+        let physical_plan = df.create_physical_plan().await.unwrap();
+        let plan_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
+        );
+        println!("Physical plan:\n{}", plan_str);
     }
 
     #[tokio::test]
