@@ -17,31 +17,33 @@ async fn main() -> Result<()> {
 
     // Define the schema for our time-series data
     let schema: SchemaRef = Arc::new(Schema::new(vec![
-        Field::new("ts_ns", DataType::Int64, false),
+        Field::new("ts_ms", DataType::Int64, false),
         Field::new("service_name", DataType::Utf8, false),
         Field::new("endpoint", DataType::Utf8, false),
-        Field::new("count", DataType::Int64, false),
+        Field::new("status_code", DataType::Int64, false),
     ]));
 
+    let hour_ms = 3600 * 1_000;
+    let now_ms = 1700870400;
     // Define shards with their HTTP endpoints and time ranges
     let shards = vec![
         ShardMetadata::new(
-            "shard_2023_11_25".to_string(),
-            "http://localhost:8001/query".to_string(),
-            1700870400, // 2023-11-25 00:00:00
-            1700956799, // 2023-11-25 23:59:59
+            "0".to_string(),
+            "http://localhost:8088/shard/0".to_string(),
+            now_ms,
+            now_ms + 1 * hour_ms,
         ),
         ShardMetadata::new(
-            "shard_2023_11_26".to_string(),
-            "http://localhost:8002/query".to_string(),
-            1700956800, // 2023-11-26 00:00:00
-            1701043199, // 2023-11-26 23:59:59
+            "1".to_string(),
+            "http://localhost:8088/shard/1".to_string(),
+            now_ms + 1 * hour_ms,
+            now_ms + 2 * hour_ms,
         ),
         ShardMetadata::new(
-            "shard_2023_11_27".to_string(),
-            "http://localhost:8003/query".to_string(),
-            1701043200, // 2023-11-27 00:00:00
-            1701129599, // 2023-11-27 23:59:59
+            "2".to_string(),
+            "http://localhost:8088/shard/2".to_string(),
+            now_ms + 2 * hour_ms,
+            now_ms + 3 * hour_ms,
         ),
     ];
 
@@ -50,7 +52,7 @@ async fn main() -> Result<()> {
         schema.clone(),
         shards,
         "events".to_string(),
-        "ts_ns".to_string(),
+        "ts_ms".to_string(),
     );
 
     // Get default optimizer rules and prepend our sharded aggregation rule
@@ -89,7 +91,7 @@ async fn main() -> Result<()> {
     println!("🔍 Query 2: SELECT with time filter (prunes to 1 shard)\n");
     let query2 = "SELECT service_name, endpoint, count 
                   FROM events 
-                  WHERE ts_ns >= 1700870400 AND ts_ns < 1700956800
+                  WHERE ts_ms >= 1700870400 AND ts_ms < 1700956800
                   LIMIT 10";
     println!("SQL: {}\n", query2);
 
@@ -105,7 +107,7 @@ async fn main() -> Result<()> {
     println!("🔍 Query 3: SELECT spanning 2 shards\n");
     let query3 = "SELECT service_name, endpoint, count 
                   FROM events 
-                  WHERE ts_ns >= 1700900000 AND ts_ns < 1701000000
+                  WHERE ts_ms >= 1700900000 AND ts_ms < 1701000000
                   LIMIT 10";
     println!("SQL: {}\n", query3);
 
@@ -148,9 +150,9 @@ async fn main() -> Result<()> {
     // Example 6: Time bucketing with computed GROUP BY
     println!("🔍 Query 6: Time bucketing with computed GROUP BY\n");
     let query6 = r#"SELECT
-    (ts_ns / 1000) AS bucket_index,
-    MIN(ts_ns) AS bucket_min_ts,
-    MAX(ts_ns) AS bucket_max_ts,
+    (ts_ms / 1000) AS bucket_index,
+    MIN(ts_ms) AS bucket_min_ts,
+    MAX(ts_ms) AS bucket_max_ts,
     SUM(count) AS total_count
 FROM events
 GROUP BY bucket_index"#;
@@ -168,9 +170,11 @@ GROUP BY bucket_index"#;
     println!("\n📝 Notes:");
     println!("  - Shard pruning works based on time filters");
     println!("  - Aggregates (COUNT, SUM, MIN, MAX) are pushed down to shards");
-    println!("  - Computed GROUP BY expressions (e.g., ts_ns / 1000) are pushed to shards");
+    println!("  - Computed GROUP BY expressions (e.g., ts_ms / 1000) are pushed to shards");
     println!("  - Final aggregation combines partial results from shards");
-    println!("\n⚠️  To actually execute queries, start HTTP shard servers on ports 8001-8003");
+    println!("\n⚠️  To actually execute queries, start HTTP shard servers on ports 8088-8003");
 
+    let df = ctx.sql(query6).await?;
+    df.show().await?;
     Ok(())
 }
